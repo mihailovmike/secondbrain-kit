@@ -1,0 +1,15 @@
+# Obsidian
+.obsidian/workspace*.json
+.trash/
+
+# LightRAG index (managed by daemon)
+.lightrag/
+
+# Runtime data
+.processed_hashes.json
+.frontmatter_cache.json
+.title_index.json
+
+# OS
+.DS_Store
+Thumbs.db

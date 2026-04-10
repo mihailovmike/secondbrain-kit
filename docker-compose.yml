@@ -1,0 +1,45 @@
+services:
+  secondbrain-qdrant:
+    image: qdrant/qdrant:latest
+    container_name: secondbrain-qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  secondbrain-daemon:
+    build: ./engine
+    container_name: secondbrain-daemon
+    volumes:
+      - ${HOST_VAULT_PATH:-./_vault}:/app/vault
+    env_file: .env
+    environment:
+      - VAULT_PATH=/app/vault
+      - INBOX_DIR_NAME=_inbox
+      - LIGHTRAG_WORKING_DIR=/app/vault/.lightrag
+      - LIGHTRAG_VECTOR_STORAGE=QdrantVectorDBStorage
+      - QDRANT_URL=http://secondbrain-qdrant:6333
+    depends_on:
+      - secondbrain-qdrant
+    restart: unless-stopped
+
+  secondbrain-webui:
+    image: ghcr.io/hkuds/lightrag:latest
+    container_name: secondbrain-webui
+    volumes:
+      - ${HOST_VAULT_PATH:-./_vault}/.lightrag:/app/data
+    environment:
+      - AUTH_ACCOUNTS=${WEBUI_USERNAME:-admin}:${WEBUI_PASSWORD:-change-me}
+      - TOKEN_SECRET=${WEBUI_JWT_SECRET:-change-me-to-random-string}
+      - HOST=0.0.0.0
+      - PORT=9621
+      - WORKING_DIR=/app/data
+      - MAX_ASYNC=16
+      - TIMEOUT=300
+    ports:
+      - "9621:9621"
+    depends_on:
+      - secondbrain-qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:

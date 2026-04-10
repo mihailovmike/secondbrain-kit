@@ -1,0 +1,23 @@
+# Environment
+.env
+!.env.example
+
+# Vault data (created by setup.sh)
+_vault/
+
+# Qdrant data
+qdrant_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,18 @@
+# SecondBrain Daemon Configuration
+# Most settings are in .env — this file is for non-secret defaults.
+
+vault:
+  path: /app/vault
+  inbox_dir: _inbox
+  # Daemon discovers folders dynamically — NEVER creates new ones (S3)
+
+api:
+  port: 8789
+  host: 0.0.0.0
+
+quality:
+  min_words: 20
+  max_words: 5000
+  code_line_threshold: 0.5
+  merge_similarity: 0.85
+  low_confidence: 0.7
