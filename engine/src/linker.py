@@ -106,7 +106,24 @@ def evaluate_value(text: str) -> tuple[bool, str]:
 
     Returns (is_valuable, reason).
     """
-    prompt = f"""Evaluate if this text contains long-term knowledge value.
+    is_session = "source: claude-session" in text or "source: claude-compact" in text
+
+    if is_session:
+        prompt = f"""This is a Claude Code session transcript (dialogue between User and Claude).
+Ignore the chat format. Look only at the SUBSTANCE of what was discussed.
+
+Accept if the session contains ANY of: architectural decisions, lessons learned,
+solved problems, discovered patterns, important project facts, principles agreed upon.
+
+Reject only if the entire session is: trivial tasks with no insights, pure
+mechanical execution with zero decisions, or completely empty of knowledge.
+
+Session transcript (first 2000 chars):
+{text[:2000]}
+
+Return JSON: {{"valuable": true/false, "reason": "one sentence about the knowledge found or absent"}}"""
+    else:
+        prompt = f"""Evaluate if this text contains long-term knowledge value.
 
 Valuable (accept): decisions and reasons, project facts, principles, concepts,
 definitions, goals, insights, lessons learned.

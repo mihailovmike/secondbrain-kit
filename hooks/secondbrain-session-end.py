@@ -37,8 +37,11 @@ def main():
                     continue
                 try:
                     entry = json.loads(line)
-                    role = entry.get("role", "")
-                    content = entry.get("content", "")
+                    msg = entry.get("message", {})
+                    if not isinstance(msg, dict):
+                        continue
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
                     if isinstance(content, list):
                         texts = []
                         for block in content:
