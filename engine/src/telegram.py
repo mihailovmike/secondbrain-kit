@@ -89,6 +89,10 @@ def _api_call(method: str, params: dict, timeout: int = 15) -> dict | None:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e else ""
+        logger.warning("Telegram API %s failed: %s — %s", method, e, body)
+        return None
     except Exception as e:
         logger.warning("Telegram API %s failed: %s", method, e)
         return None
