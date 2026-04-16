@@ -23,6 +23,7 @@ from .linker import (
 from .telegram import notify_inbox
 from .approval import submit_for_approval, APPROVAL_MODE
 from .codebase_sync import maybe_sync_codebase_info
+from .path_sync import VAULT_SKIP_DIRS
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,6 @@ def _register_doc_title(content: str, title: str) -> None:
     except Exception:
         pass
 
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
 
 # Similarity threshold for merging (S1: uniqueness principle)
 MERGE_THRESHOLD = float(os.getenv("MERGE_THRESHOLD", "0.85"))
@@ -65,6 +65,53 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
+# Structural fallback links: folder prefix → anchor note title.
+# Used when LLM and graph-based link discovery both return nothing.
+STRUCTURAL_LINK_MAP = {
+    "projects/codebase-info": "Codebase Index",
+    "projects/tg-channel": "mike-telegram-channel",
+    "knowledge": "Михаил Михайлов",
+    "health": "Профиль здоровья",
+    "goals": "Все цели",
+    "ideas": "Михаил Михайлов",
+    "investments": "Инвестиционные цели",
+}
+_DEFAULT_FALLBACK_LINK = "Михаил Михайлов"
+
+
+def _ensure_links(analysis: dict, raw_text: str, folder: str) -> None:
+    """Guarantee at least 1 wiki-link. Mutates analysis['links'] in place.
+
+    Fallback chain:
+      1. Graph-based suggest_links() (no LLM cost)
+      2. Structural link by folder prefix
+      3. Default link to vault owner
+    """
+    if analysis.get("links"):
+        return
+
+    # Fallback 1: graph-based discovery
+    existing_titles = {t.lower() for t in get_existing_note_titles(VAULT_PATH)}
+    own_title = analysis.get("title", "").lower()
+    fallback = suggest_links(raw_text, VAULT_PATH, limit=3)
+    fallback = [l for l in fallback if l.lower() in existing_titles and l.lower() != own_title]
+    if fallback:
+        analysis["links"] = fallback
+        logger.info("Graph fallback links for '%s': %s", analysis.get("title"), fallback)
+        return
+
+    # Fallback 2: structural link by folder
+    for prefix, target in STRUCTURAL_LINK_MAP.items():
+        if folder.startswith(prefix):
+            analysis["links"] = [target]
+            logger.info("Structural fallback: '%s' → [[%s]]", analysis.get("title"), target)
+            return
+
+    # Fallback 3: default to vault owner
+    analysis["links"] = [_DEFAULT_FALLBACK_LINK]
+    logger.info("Default fallback: '%s' → [[%s]]", analysis.get("title"), _DEFAULT_FALLBACK_LINK)
+
+
 def _list_vault_paths() -> list[str]:
     """Discover all note folder paths in vault (recursive, relative)."""
     vault = Path(VAULT_PATH)
@@ -74,7 +121,7 @@ def _list_vault_paths() -> list[str]:
             continue
         rel = d.relative_to(vault)
         parts = rel.parts
-        if any(p in _SKIP_DIRS or p.startswith(".") for p in parts):
+        if any(p in VAULT_SKIP_DIRS or p.startswith(".") for p in parts):
             continue
         if parts[0] == INBOX_DIR_NAME:
             continue
@@ -157,7 +204,7 @@ def _find_vault_file(slug: str) -> Path | None:
     for match in vault.rglob(f"{slug}.md"):
         rel = match.relative_to(vault)
         parts = rel.parts
-        if any(p in _SKIP_DIRS or p.startswith(".") for p in parts):
+        if any(p in VAULT_SKIP_DIRS or p.startswith(".") for p in parts):
             continue
         if parts[0] != INBOX_DIR_NAME:
             return match
@@ -409,6 +456,10 @@ def _process_session(raw_text: str, inbox_path: Path) -> list[str]:
         if folder is None:
             folder = INBOX_DIR_NAME
             needs_review = True
+
+        # Ensure at least 1 link — no orphan notes rule
+        _ensure_links(analysis, body, folder or INBOX_DIR_NAME)
+
         if confidence < 0.7:
             folder = INBOX_DIR_NAME
             needs_review = True
@@ -567,17 +618,7 @@ def _create_new_note(raw_text: str, inbox_path: Path, source: str = "unknown",
         if link.lower() in existing_titles and link.lower() != own_title
     ]
 
-    # Ensure at least 1 link (no orphan notes rule)
-    if not analysis["links"]:
-        fallback_links = suggest_links(raw_text, VAULT_PATH, limit=3)
-        analysis["links"] = [
-            l for l in fallback_links
-            if l.lower() in existing_titles and l.lower() != own_title
-        ]
-        if analysis["links"]:
-            logger.info("Links found via suggest_links fallback: %s", analysis["links"])
-
-    # Determine target folder (S2: closed vocabulary)
+    # Determine target folder first (needed for structural link fallback)
     vault = Path(VAULT_PATH)
     folder = _pick_folder(analysis, vault)
     needs_review = False
@@ -585,12 +626,14 @@ def _create_new_note(raw_text: str, inbox_path: Path, source: str = "unknown",
     suggested_folder = ""
 
     if folder is None:
-        # No matching folder — suggest new domain, stay in inbox
         suggested_folder = suggest_folder(raw_text, VAULT_PATH)
         folder = INBOX_DIR_NAME
         needs_review = True
         needs_folder = True
         logger.info("No matching folder, suggesting '%s', staying in inbox", suggested_folder)
+
+    # Ensure at least 1 link — no orphan notes rule (3-level fallback)
+    _ensure_links(analysis, raw_text, folder or INBOX_DIR_NAME)
 
     if confidence < 0.7:
         folder = INBOX_DIR_NAME

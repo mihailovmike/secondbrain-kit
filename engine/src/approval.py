@@ -203,6 +203,32 @@ def _slugify_simple(text: str) -> str:
     return re.sub(r"[-\s]+", "-", text).strip("-")
 
 
+def _ensure_post_approval_links(target_path: Path, folder: str) -> None:
+    """Verify approved note has at least 1 wiki-link; add structural fallback if not."""
+    try:
+        content = target_path.read_text("utf-8")
+        import re as _re
+        if _re.search(r"\[\[[^\]]+\]\]", content):
+            return  # Has at least one wiki-link
+
+        # Import structural fallback from processor
+        from .processor import STRUCTURAL_LINK_MAP, _DEFAULT_FALLBACK_LINK
+        target_link = _DEFAULT_FALLBACK_LINK
+        for prefix, link in STRUCTURAL_LINK_MAP.items():
+            if folder.startswith(prefix):
+                target_link = link
+                break
+
+        if f"## Links" in content:
+            content = content.replace("## Links\n", f"## Links\n- [[{target_link}]]\n")
+        else:
+            content = content.rstrip("\n") + f"\n\n## Links\n- [[{target_link}]]\n"
+        target_path.write_text(content, "utf-8")
+        logger.info("Post-approval structural link added: [[%s]] → %s", target_link, target_path.name)
+    except Exception as e:
+        logger.warning("Post-approval link check failed: %s", e)
+
+
 def handle_callback(
     action: str, slug: str,
     callback_id: str, chat_id: str, message_id: int,
@@ -286,6 +312,9 @@ def handle_callback(
                 logger.warning("LightRAG insert after approval failed: %s", e)
             _update_forward_links(target_path, existing_links)
             _inject_backlinks_for_note(title, existing_links)
+
+            # Anti-orphan: verify note has at least 1 link after all enrichment
+            _ensure_post_approval_links(target_path, folder)
 
         answer_callback(callback_id, f"✅ {title} → {folder}")
         delete_message(chat_id, message_id)
