@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -229,6 +230,62 @@ def _ensure_post_approval_links(target_path: Path, folder: str) -> None:
         logger.warning("Post-approval link check failed: %s", e)
 
 
+def _background_index_worker(
+    target_path: Path, vault: Path, title: str, folder: str,
+    existing_links: list[str], run_dedup_after: bool,
+    include_definition_drafts: bool,
+) -> None:
+    """Heavy post-approval work: LightRAG insert, dedup, link enrichment.
+
+    Runs in a daemon thread so Telegram callback can return instantly.
+    """
+    rel_path = str(target_path.relative_to(vault))
+    try:
+        from .lightrag_engine import insert as lightrag_insert
+        content = target_path.read_text("utf-8")
+        lightrag_insert(content, file_path=rel_path)
+        logger.info("Approved + indexed: %s → %s", title, rel_path)
+        if include_definition_drafts:
+            _create_definition_drafts(content, vault)
+        if run_dedup_after:
+            try:
+                from .graph_dedup import run_dedup
+                dedup = run_dedup(vault_path=str(vault), dry_run=False)
+                if dedup.get("merged"):
+                    logger.info(
+                        "Entity dedup: merged %d cluster(s) after insert",
+                        len(dedup["merged"]),
+                    )
+            except Exception as dedup_err:
+                logger.warning("Entity dedup (non-blocking): %s", dedup_err)
+    except Exception as e:
+        logger.warning("LightRAG insert after approval failed: %s", e)
+
+    try:
+        _update_forward_links(target_path, existing_links)
+        _inject_backlinks_for_note(title, existing_links)
+        _ensure_post_approval_links(target_path, folder)
+    except Exception as e:
+        logger.warning("Post-approval link enrichment failed: %s", e)
+
+
+def _run_background_index(
+    target_path: Path, vault: Path, title: str, folder: str,
+    existing_links: list[str], run_dedup_after: bool,
+    include_definition_drafts: bool,
+) -> None:
+    """Spawn a daemon thread to run post-approval indexing."""
+    threading.Thread(
+        target=_background_index_worker,
+        args=(
+            target_path, vault, title, folder, existing_links,
+            run_dedup_after, include_definition_drafts,
+        ),
+        daemon=True,
+        name=f"approve-index-{target_path.stem[:20]}",
+    ).start()
+
+
 def handle_callback(
     action: str, slug: str,
     callback_id: str, chat_id: str, message_id: int,
@@ -287,38 +344,17 @@ def handle_callback(
                 vault, entry["type"], entry["new_type_label"],
             )
 
-        # LightRAG insert + link sync (skip for personal-data)
-        ct = entry.get("content_type", "")
-        rel_path = str(target_path.relative_to(vault))
-        existing_links = entry.get("links", [])
-        if ct != "personal-data":
-            try:
-                from .lightrag_engine import insert as lightrag_insert
-                content = target_path.read_text("utf-8")
-                lightrag_insert(content, file_path=rel_path)
-                logger.info("Approved + indexed: %s → %s", title, rel_path)
-                _create_definition_drafts(content, vault)
-                try:
-                    from .graph_dedup import run_dedup
-                    dedup = run_dedup(vault_path=str(vault), dry_run=False)
-                    if dedup.get("merged"):
-                        logger.info(
-                            "Entity dedup: merged %d cluster(s) after insert",
-                            len(dedup["merged"]),
-                        )
-                except Exception as dedup_err:
-                    logger.warning("Entity dedup (non-blocking): %s", dedup_err)
-            except Exception as e:
-                logger.warning("LightRAG insert after approval failed: %s", e)
-            _update_forward_links(target_path, existing_links)
-            _inject_backlinks_for_note(title, existing_links)
-
-            # Anti-orphan: verify note has at least 1 link after all enrichment
-            _ensure_post_approval_links(target_path, folder)
-
         answer_callback(callback_id, f"✅ {title} → {folder}")
         delete_message(chat_id, message_id)
         _queue.remove(slug)
+
+        ct = entry.get("content_type", "")
+        if ct != "personal-data":
+            _run_background_index(
+                target_path, vault, title, folder,
+                entry.get("links", []), run_dedup_after=True,
+                include_definition_drafts=True,
+            )
 
     elif action == "r":
         # Reject: delete file
@@ -342,25 +378,18 @@ def handle_callback(
         shutil.move(str(source_path), str(target_path))
         _remove_proposed_folder_from_frontmatter(target_path)
 
-        # LightRAG insert + link sync (skip for personal-data)
-        ct = entry.get("content_type", "")
-        rel_path = str(target_path.relative_to(vault))
-        existing_links = entry.get("links", [])
-        if ct != "personal-data":
-            try:
-                from .lightrag_engine import insert as lightrag_insert
-                content = target_path.read_text("utf-8")
-                lightrag_insert(content, file_path=rel_path)
-            except Exception as e:
-                logger.warning("LightRAG insert after folder create failed: %s", e)
-            _update_forward_links(target_path, existing_links)
-            _inject_backlinks_for_note(title, existing_links)
-            _ensure_post_approval_links(target_path, folder)
-
         answer_callback(callback_id, f"📂 {title} → {folder}")
         delete_message(chat_id, message_id)
         _queue.remove(slug)
         logger.info("Created folder + moved: %s → %s", title, folder)
+
+        ct = entry.get("content_type", "")
+        if ct != "personal-data":
+            _run_background_index(
+                target_path, vault, title, folder,
+                entry.get("links", []), run_dedup_after=False,
+                include_definition_drafts=False,
+            )
 
     elif action == "k":
         # Keep in inbox for manual editing
