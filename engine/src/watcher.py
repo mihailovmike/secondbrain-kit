@@ -25,6 +25,9 @@ from .path_sync import (
     handle_modify,
     sync_paths,
     _is_vault_note,
+    VAULT_SKIP_DIRS,
+    VAULT_OWNER_FILES,
+    is_owner_root_file,
 )
 
 logging.basicConfig(
@@ -106,6 +109,33 @@ def _delete_by_path(rel_path: str) -> bool:
     return False
 
 
+def _find_backlinks(stem: str, vault_path: str) -> list[str]:
+    """Grep vault for [[<stem>]]- or [[<stem>|...]]-style wiki-links.
+
+    Returns vault-relative paths of notes referencing the given stem, excluding
+    _inbox/, _system/, templates/, dotfiles. Used to warn about broken links
+    when a note is removed.
+    """
+    import re as _re
+    pattern = _re.compile(
+        r"\[\[" + _re.escape(stem) + r"(?:\]\]|[\|#][^\]]*\]\])"
+    )
+    out: list[str] = []
+    vault = Path(vault_path)
+    for d in vault.iterdir():
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
+            continue
+        for f in d.rglob("*.md"):
+            if f.name.startswith("."):
+                continue
+            try:
+                if pattern.search(f.read_text(encoding="utf-8")):
+                    out.append(str(f.relative_to(vault)))
+            except Exception:
+                pass
+    return out
+
+
 class VaultHandler(FileSystemEventHandler):
     """Watch entire vault for renames, moves, title changes, creates and deletes."""
 
@@ -163,14 +193,20 @@ class VaultHandler(FileSystemEventHandler):
         except ValueError:
             return
         parts = Path(rel).parts
-        # Must be inside a subdirectory (root-level files are system files)
-        if len(parts) < 2:
+        if len(parts) == 1:
+            # Root-level owner file disappeared — critical, alert but do not auto-delete.
+            if parts[0] in VAULT_OWNER_FILES:
+                logger.error("Owner hub file removed: %s — NOT auto-deleting from graph", rel)
+                notify_inbox(
+                    f"⚠️ <b>Удалён owner hub-файл</b>\n"
+                    f"<code>{rel}</code>\n"
+                    f"Авто-удаление из графа отключено. "
+                    f"Восстановите файл или удалите вручную через POST /reindex-sync."
+                )
             return
-        skip_dirs = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
-        inbox = os.getenv("INBOX_DIR_NAME", "_inbox")
-        if any(p in skip_dirs or p.startswith(".") for p in parts):
+        if any(p in VAULT_SKIP_DIRS or p.startswith(".") for p in parts):
             return
-        if parts and parts[0] == inbox:
+        if parts and parts[0] == INBOX_DIR_NAME:
             return
         with self._lock:
             # Cancel pending create for same path
@@ -219,13 +255,19 @@ class VaultHandler(FileSystemEventHandler):
         for path in to_delete:
             try:
                 rel_path = os.path.relpath(path, VAULT_PATH)
-                logger.info("File removed from vault (not deleting from graph): %s", rel_path)
-                notify_inbox(
-                    f"🗑 <b>Файл удалён из vault</b>\n"
-                    f"<code>{rel_path}</code>\n"
-                    f"Запись в графе сохранена. Удалить из графа вручную: "
-                    f"<code>POST /reindex-sync</code>"
-                )
+                logger.info("File removed from vault, queued for orphan sync: %s", rel_path)
+                stem = Path(rel_path).stem
+                backlinks = _find_backlinks(stem, VAULT_PATH)
+                if backlinks:
+                    preview = "\n".join(f"• <code>{b}</code>" for b in backlinks[:10])
+                    more = f"\n…и ещё {len(backlinks) - 10}" if len(backlinks) > 10 else ""
+                    notify_inbox(
+                        f"🗑 <b>Файл удалён из vault</b>\n"
+                        f"<code>{rel_path}</code>\n\n"
+                        f"Остались битые [[{stem}]]-ссылки в {len(backlinks)} заметках:\n"
+                        f"{preview}{more}\n\n"
+                        f"Авто-удаление из графа через ~2 мин."
+                    )
                 deleted += 1
             except Exception as e:
                 logger.warning("Delete notify failed for %s: %s", path, e)
@@ -279,7 +321,6 @@ def start_watcher() -> None:
         from .index_generator import write_index
 
         vault = Path(VAULT_PATH)
-        skip = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
         indexed = 0
         skipped = 0
         errors = 0
@@ -296,29 +337,45 @@ def start_watcher() -> None:
         except Exception:
             processed_paths = set()
 
+        import re as _re
+        _LAYER_RE = _re.compile(r'^layer:\s*([123])', _re.MULTILINE)
+
+        skipped_by_layer = 0
+
+        def _index_file(f: Path) -> None:
+            nonlocal indexed, skipped, skipped_by_layer, errors
+            try:
+                rel_path = str(f.relative_to(vault))
+                if rel_path in processed_paths:
+                    skipped += 1
+                    return
+                content = f.read_text(encoding="utf-8")
+                m = _LAYER_RE.search(content[:500])
+                if m and m.group(1) in ("2", "3"):
+                    skipped_by_layer += 1
+                    return
+                lightrag_insert(content, file_path=rel_path)
+                indexed += 1
+            except Exception as e:
+                logger.warning("Startup reindex failed for %s: %s", f, e)
+                errors += 1
+
         for d in vault.iterdir():
-            if not d.is_dir() or d.name in skip or d.name.startswith("."):
-                continue
-            if d.name == INBOX_DIR_NAME:
+            if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
                 continue
             for f in d.rglob("*.md"):
                 if f.name.startswith("."):
                     continue
-                try:
-                    rel_path = str(f.relative_to(vault))
-                    if rel_path in processed_paths:
-                        skipped += 1
-                        continue
-                    content = f.read_text(encoding="utf-8")
-                    lightrag_insert(content, file_path=rel_path)
-                    indexed += 1
-                except Exception as e:
-                    logger.warning("Startup reindex failed for %s: %s", f, e)
-                    errors += 1
+                _index_file(f)
+
+        # Root-level owner hub files
+        from .path_sync import list_owner_root_paths
+        for rel in list_owner_root_paths(str(vault)):
+            _index_file(vault / rel)
 
         logger.info(
-            "Startup reindex: %d new, %d already indexed, %d errors",
-            indexed, skipped, errors,
+            "Startup reindex: %d new, %d already indexed, %d skipped by layer (2/3), %d errors",
+            indexed, skipped, skipped_by_layer, errors,
         )
         if indexed:
             notify_inbox(f"🔄 Реиндекс при старте: {indexed} новых заметок")
@@ -414,19 +471,54 @@ def start_watcher() -> None:
                     logger.warning(f"Path sync failed: {e}")
                 last_path_sync = now
 
-            # Periodic graph sync: detect orphans + TTL cleanup of old notifications
+            # Periodic graph sync: orphan detection + auto-delete (режим B, grace window)
             if now - last_graph_sync >= SYNC_INTERVAL:
                 try:
-                    result = sync_with_vault(VAULT_PATH, dry_run=True)
+                    auto_delete = os.getenv("AUTO_SYNC_DELETE", "true").lower() == "true"
+                    result = sync_with_vault(
+                        VAULT_PATH,
+                        dry_run=not auto_delete,
+                        min_orphan_age_sec=int(os.getenv("ORPHAN_MIN_AGE_SEC", "120")),
+                    )
                     orphans = result.get("orphans", [])
-                    current_set = frozenset(orphans)
-                    if orphans and current_set != _last_orphan_set:
-                        logger.info("Graph sync: %d orphan docs found (not deleted)", len(orphans))
-                        notify_orphans(orphans)
+                    deleted = result.get("deleted", [])
+                    deferred = result.get("deferred", [])
+                    owner_missing = result.get("owner_missing", [])
+                    archive_pts = result.get("archive_points_removed", 0)
+
+                    if deleted:
+                        logger.info(
+                            "Graph sync: auto-deleted %d orphan docs (archive points: %d, deferred: %d)",
+                            len(deleted), archive_pts, len(deferred),
+                        )
+                        preview = "\n".join(
+                            f"• <code>{fp}</code>"
+                            for fp in [o for o in orphans if o not in deferred and o not in owner_missing][:10]
+                        )
+                        more = "\n…" if len(deleted) > 10 else ""
+                        notify_inbox(
+                            f"🧹 <b>Авто-чистка графа</b>\n"
+                            f"Удалено <b>{len(deleted)}</b> orphan-документов\n"
+                            f"Layer 2 archives очищено: <b>{archive_pts}</b>\n\n"
+                            f"{preview}{more}"
+                        )
+
+                    current_set = frozenset(deferred)
+                    if deferred and current_set != _last_orphan_set:
+                        logger.info(
+                            "Graph sync: %d orphan(s) in grace window (will delete after min_orphan_age)",
+                            len(deferred),
+                        )
                         _last_orphan_set = current_set
-                    elif not orphans and _last_orphan_set:
-                        logger.info("Graph sync: all orphans resolved")
+                    elif not deferred and _last_orphan_set:
                         _last_orphan_set = frozenset()
+
+                    if owner_missing:
+                        notify_inbox(
+                            f"⚠️ <b>Owner hub-файл отсутствует</b>\n"
+                            f"{', '.join(owner_missing)}\n"
+                            f"Граф НЕ чистится. Восстановите файл или удалите вручную."
+                        )
                 except Exception as e:
                     logger.warning(f"Graph sync failed: {e}")
 

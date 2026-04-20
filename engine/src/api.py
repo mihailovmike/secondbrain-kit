@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,8 +17,9 @@ from .lightrag_engine import (
     query_data,
     stats as lightrag_stats,
     sync_with_vault,
+    delete_doc,
 )
-from .approval import handle_callback
+from .approval import handle_callback, resend_all as _approval_resend_all
 from .processor import process_file
 from .telegram import answer_callback
 from .voice import process_voice
@@ -84,6 +86,18 @@ class StatsResponse(BaseModel):
     vector_storage: str
 
 
+class ArchiveSearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+class ArchiveAddRequest(BaseModel):
+    text: str
+    file_path: str = ""
+    title: str = ""
+    tags: list[str] = []
+
+
 # --- Endpoints ---
 
 @app.on_event("startup")
@@ -97,6 +111,249 @@ async def search_vault(req: SearchRequest, _=Depends(verify_api_key)):
     """Semantic search via LightRAG knowledge graph."""
     data = query_data(req.query, mode=req.mode, top_k=req.top_k)
     return {"query": req.query, "mode": req.mode, "context": data}
+
+
+@app.post("/archive/search")
+async def search_archive(req: ArchiveSearchRequest, _=Depends(verify_api_key)):
+    """Vector-only semantic search in Layer 2 archives collection.
+
+    Returns raw fragments without LLM synthesis. Use for finding
+    session logs, transcripts, or dumps by semantic similarity.
+    """
+    try:
+        from .vector_store import search_archive as _search
+        hits = _search(req.query, top_k=req.top_k)
+        return {"query": req.query, "collection": "archives", "hits": hits}
+    except Exception as e:
+        logger.warning("Archive search failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"archive search failed: {e}")
+
+
+@app.post("/approval/resend-all")
+async def approval_resend_all(_=Depends(verify_api_key)):
+    """Force-resend every pending approval message to Telegram.
+
+    Deletes stale messages, drops queue entries whose file is gone,
+    resends the rest with fresh message IDs and current link URL.
+    """
+    return _approval_resend_all()
+
+
+@app.post("/approval/auto-process")
+async def approval_auto_process(_=Depends(verify_api_key)):
+    """Run the auto-approve worker once over the pending queue.
+
+    Behaviour gated by env vars (see src/auto_approve.py):
+    - AUTO_APPROVE_ENABLED=false (default): dry-run; returns what would
+      have happened without touching files.
+    - AUTO_APPROVE_ENABLED=true: acts on eligible entries (auto-delete
+      stale sessions, auto-approve high-confidence novel notes), sends
+      Telegram undo notifications.
+
+    Meant to be called by cron (hourly or daily).
+    """
+    from .auto_approve import auto_process_queue
+    return auto_process_queue()
+
+
+@app.post("/maintenance/weekly")
+async def maintenance_weekly(_=Depends(verify_api_key)):
+    """Run weekly brain hygiene. Safe to call any time.
+
+    Steps:
+    1. sync_with_vault — remove orphan doc_ids (file deleted from vault).
+    2. cleanup-layer-noise (dry_run=false) — remove Layer 2/3 docs from KG.
+    3. sync-links — inject missing [[wikilinks]] based on KG relations.
+    4. Identify orphan notes (no in/out wikilinks) — return list, do NOT delete.
+    5. Regenerate _index.md.
+
+    Returns a structured report for inspection / Telegram digest.
+    """
+    from .lightrag_engine import sync_with_vault, delete_doc
+    from .index_generator import write_index
+    from .link_integrity import WIKI_LINK_RE, _vault_md_files
+
+    report: dict = {"started_at": datetime.now(timezone.utc).isoformat()}
+
+    # 1. Orphan sync (immediate — weekly cadence means no grace period needed)
+    try:
+        sync = sync_with_vault(VAULT_PATH, dry_run=False, min_orphan_age_sec=0)
+        report["orphan_sync"] = {
+            "deleted": len(sync.get("deleted", [])),
+            "kept": sync.get("kept", 0),
+            "archive_points_removed": sync.get("archive_points_removed", 0),
+            "owner_missing": sync.get("owner_missing", []),
+        }
+    except Exception as e:
+        report["orphan_sync_error"] = str(e)
+
+    # 2. Layer 2/3 noise cleanup (reusing the endpoint's logic inline)
+    try:
+        noise_deleted = 0
+        import re as _re
+        _FM = _re.compile(r"^---\n(.*?)\n---", _re.DOTALL)
+        _LAYER = _re.compile(r"^layer:\s*([123])", _re.MULTILINE)
+        rag = get_instance()
+        for doc_id, info in list((rag.doc_status._data or {}).items()):
+            if not isinstance(info, dict):
+                continue
+            rel = info.get("file_path") or ""
+            if not rel:
+                continue
+            fp = Path(VAULT_PATH) / rel
+            if not fp.exists():
+                continue
+            try:
+                head = fp.read_text(encoding="utf-8")[:1000]
+            except Exception:
+                continue
+            m = _FM.match(head)
+            if not m:
+                continue
+            lm = _LAYER.search(m.group(1))
+            if lm and int(lm.group(1)) in (2, 3):
+                if delete_doc(doc_id):
+                    noise_deleted += 1
+        report["layer_noise_deleted"] = noise_deleted
+    except Exception as e:
+        report["layer_noise_error"] = str(e)
+
+    # 3. Wiki-link sync
+    try:
+        link_result = _sync_all_links()
+        report["link_sync"] = {
+            "links_added": link_result.get("total_links_added", 0),
+            "notes_updated": len(link_result.get("notes_updated", [])),
+        }
+    except Exception as e:
+        report["link_sync_error"] = str(e)
+
+    # 4. Orphan notes (no wiki-links in any direction)
+    try:
+        vault = Path(VAULT_PATH)
+        incoming: dict[str, int] = {}
+        outgoing: dict[str, int] = {}
+        titles_by_path: dict[str, str] = {}
+        for f in _vault_md_files(VAULT_PATH):
+            rel = str(f.relative_to(vault))
+            text = f.read_text(encoding="utf-8")
+            title_m = re.search(r'^title:\s*"?([^"\n]+)"?', text, re.MULTILINE)
+            if title_m:
+                titles_by_path[rel] = title_m.group(1).strip()
+            out_links = set()
+            for m in WIKI_LINK_RE.finditer(text):
+                base = m.group(1).split("#")[0].split("|")[0].strip().lower()
+                out_links.add(base)
+                incoming[base] = incoming.get(base, 0) + 1
+            outgoing[rel] = len(out_links)
+        orphans = []
+        for rel, title in titles_by_path.items():
+            in_count = incoming.get(title.lower(), 0)
+            out_count = outgoing.get(rel, 0)
+            if in_count == 0 and out_count == 0:
+                orphans.append({"path": rel, "title": title})
+        report["orphan_notes"] = orphans[:50]
+        report["orphan_notes_total"] = len(orphans)
+    except Exception as e:
+        report["orphan_notes_error"] = str(e)
+
+    # 5. Index regen
+    try:
+        write_index(VAULT_PATH)
+        report["index_regenerated"] = True
+    except Exception as e:
+        report["index_error"] = str(e)
+
+    # 6. Entity description cleanup (<SEP> compression)
+    try:
+        from .entity_cleanup import clean_sep_descriptions
+        cleanup = clean_sep_descriptions(dry_run=False, limit=None, use_llm=True)
+        report["entity_desc_cleanup"] = {
+            "total_with_sep": cleanup.get("total_with_sep", 0),
+            "updated": cleanup.get("updated", 0),
+            "failed": cleanup.get("failed", 0),
+        }
+    except Exception as e:
+        report["entity_desc_cleanup_error"] = str(e)
+
+    report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return report
+
+
+@app.post("/cleanup-layer-noise")
+async def cleanup_layer_noise(dry_run: bool = True, _=Depends(verify_api_key)):
+    """Remove docs whose file has `layer: 2` or `layer: 3` frontmatter from KG.
+
+    These docs don't belong in the knowledge graph (Layer 2 = archives,
+    Layer 3 = private profile). Returns count of docs identified + deleted.
+
+    Query param ``dry_run=false`` actually deletes; default is audit-only.
+    """
+    import re as _re
+    _FM = _re.compile(r"^---\n(.*?)\n---", _re.DOTALL)
+    _LAYER = _re.compile(r"^layer:\s*([123])", _re.MULTILINE)
+
+    rag = get_instance()
+    vault = Path(VAULT_PATH)
+    to_delete: list[tuple[str, str, int]] = []
+
+    data = getattr(rag.doc_status, "_data", None) or {}
+    for doc_id, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        rel_path = info.get("file_path") or ""
+        if not rel_path:
+            continue
+        fp = vault / rel_path
+        if not fp.exists():
+            continue  # orphan — handle via sync_with_vault separately
+        try:
+            head = fp.read_text(encoding="utf-8")[:1000]
+        except Exception:
+            continue
+        m = _FM.match(head)
+        if not m:
+            continue
+        lm = _LAYER.search(m.group(1))
+        if not lm:
+            continue
+        layer = int(lm.group(1))
+        if layer in (2, 3):
+            to_delete.append((doc_id, rel_path, layer))
+
+    deleted = 0
+    failed = 0
+    if not dry_run:
+        for doc_id, _rp, _l in to_delete:
+            if delete_doc(doc_id):
+                deleted += 1
+            else:
+                failed += 1
+
+    return {
+        "candidates": len(to_delete),
+        "deleted": deleted,
+        "failed": failed,
+        "dry_run": dry_run,
+        "sample": [{"doc_id": d, "file_path": p, "layer": l}
+                   for d, p, l in to_delete[:20]],
+    }
+
+
+@app.post("/archive/add")
+async def add_to_archive(req: ArchiveAddRequest, _=Depends(verify_api_key)):
+    """Store text directly in Layer 2 archives (no gate, no KG extraction)."""
+    try:
+        from .vector_store import insert_archive
+        point_id = insert_archive(req.text, metadata={
+            "file_path": req.file_path,
+            "title": req.title,
+            "tags": req.tags,
+        })
+        return {"point_id": point_id, "layer": 2, "collection": "archives"}
+    except Exception as e:
+        logger.warning("Archive add failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"archive add failed: {e}")
 
 
 @app.post("/add", response_model=AddResponse)
@@ -260,9 +517,22 @@ async def graph_view(entity: str = "", _=Depends(verify_api_key)):
 
 def _reindex_vault() -> dict:
     """Re-index all vault notes into LightRAG. Shared by API and watcher."""
+    from .path_sync import list_owner_root_paths
+
     vault = Path(VAULT_PATH)
     indexed = 0
     errors = 0
+
+    def _insert(f: Path) -> None:
+        nonlocal indexed, errors
+        try:
+            content = f.read_text(encoding="utf-8")
+            rel_path = str(f.relative_to(vault))
+            lightrag_insert(content, file_path=rel_path)
+            indexed += 1
+        except Exception as e:
+            logger.warning("Reindex failed for %s: %s", f, e)
+            errors += 1
 
     for d in vault.iterdir():
         if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
@@ -270,14 +540,11 @@ def _reindex_vault() -> dict:
         for f in d.rglob("*.md"):
             if f.name.startswith("."):
                 continue
-            try:
-                content = f.read_text(encoding="utf-8")
-                rel_path = str(f.relative_to(vault))
-                lightrag_insert(content, file_path=rel_path)
-                indexed += 1
-            except Exception as e:
-                logger.warning("Reindex failed for %s: %s", f, e)
-                errors += 1
+            _insert(f)
+
+    # Root-level owner hub files
+    for rel in list_owner_root_paths(str(vault)):
+        _insert(vault / rel)
 
     logger.info("Reindex complete: %d indexed, %d errors", indexed, errors)
 
@@ -373,6 +640,28 @@ async def sync_links(_=Depends(verify_api_key)):
     multiple times. Changes are picked up by git-sync.sh on next run.
     """
     return _sync_all_links()
+
+
+@app.post("/cleanup-entity-descriptions")
+async def cleanup_entity_descriptions(
+    dry_run: bool = False,
+    limit: int | None = None,
+    use_llm: bool = True,
+    _=Depends(verify_api_key),
+):
+    """Compress <SEP>-aggregated entity descriptions in the KG.
+
+    Dedups duplicates across SEP-separated fragments; when ≥ 2 unique
+    fragments remain and total length exceeds the threshold, Gemini
+    paraphrases them into a single coherent description.
+    """
+    import asyncio
+    from .entity_cleanup import clean_sep_descriptions
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: clean_sep_descriptions(dry_run=dry_run, limit=limit, use_llm=use_llm),
+    )
 
 
 @app.post("/dedup-entities")

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from lightrag import LightRAG, QueryParam
 from lightrag.llm.gemini import gemini_model_complete, gemini_embed
+from lightrag.llm.openai import openai_complete_if_cache
 from lightrag.utils import EmbeddingFunc
 
 from .path_sync import VAULT_SKIP_DIRS
@@ -117,19 +118,56 @@ def _load_definitions_context(vault_path: str) -> str:
     return header + "\n" + "\n".join(lines)
 
 
+_ENTITY_EXTRACTION_GUARDRAIL = """
+IMPORTANT: Only extract meaningful knowledge entities (people, concepts, projects, tools, organizations, metrics).
+NEVER extract as entities:
+- File paths or directory names (/coding/..., ./src/..., ~/.config/...)
+- Config file names (.bashrc, .env, .zshrc, .claude.json)
+- URLs or URIs (https://..., http://...)
+- JSON/YAML keys or values ("approved": true, status: done)
+- Code tokens, variable names, function signatures
+- UUIDs, hashes, or random identifiers
+- Pure numbers or dates without context (2025, 100, 3.14)
+- Markdown syntax or formatting tokens
+""".strip()
+
+
 def _make_llm_with_context(base_func, context_str: str):
     """Wrap gemini_model_complete to inject entity hints into extraction prompts."""
     import functools
+
+    guardrail = _ENTITY_EXTRACTION_GUARDRAIL
+    if context_str:
+        guardrail = f"{context_str}\n\n{guardrail}"
 
     @functools.wraps(base_func)
     async def wrapper(prompt, system_prompt=None, **kwargs):
         if system_prompt and any(
             kw in system_prompt.lower() for kw in ("entity", "named", "extract")
         ):
-            system_prompt = f"{context_str}\n\n{system_prompt}"
+            system_prompt = f"{guardrail}\n\n{system_prompt}"
         return await base_func(prompt, system_prompt=system_prompt, **kwargs)
 
     return wrapper
+
+
+async def _openrouter_complete(prompt, system_prompt=None, history_messages=None,
+                                keyword_extraction=False, **kwargs):
+    """LightRAG-compatible wrapper over OpenRouter's OpenAI-compatible API.
+
+    Activated when OPENROUTER_API_KEY is set. Model name comes from
+    LIGHTRAG_LLM_MODEL (must be an OpenRouter slug like
+    ``google/gemini-2.5-pro``). Embedding stays on Gemini direct.
+    """
+    return await openai_complete_if_cache(
+        os.getenv("LIGHTRAG_LLM_MODEL", "google/gemini-2.5-pro"),
+        prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages or [],
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+        base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        **kwargs,
+    )
 
 
 async def _create_instance() -> LightRAG:
@@ -140,10 +178,18 @@ async def _create_instance() -> LightRAG:
     vault_path = os.getenv("VAULT_PATH", "")
     ctx_str = _load_definitions_context(vault_path) if vault_path else ""
     if ctx_str:
-        llm_func = _make_llm_with_context(gemini_model_complete, ctx_str)
         logger.info("definitions_context loaded (%d entities)", ctx_str.count("\n- ") + 1)
+
+    # Pick LLM backend: OpenRouter (paid, preferred when key is set) or Gemini direct.
+    if os.getenv("OPENROUTER_API_KEY"):
+        base_llm = _openrouter_complete
+        llm_backend = f"openrouter:{cfg['llm_model']}"
     else:
-        llm_func = gemini_model_complete
+        base_llm = gemini_model_complete
+        llm_backend = f"gemini:{cfg['llm_model']}"
+
+    # Always wrap LLM with guardrail (entity extraction filter) + optional definitions
+    llm_func = _make_llm_with_context(base_llm, ctx_str)
 
     rag = LightRAG(
         working_dir=working_dir,
@@ -166,7 +212,7 @@ async def _create_instance() -> LightRAG:
     await rag.initialize_storages()
     logger.info(
         "LightRAG initialized: working_dir=%s llm=%s embedding=%s dim=%d storage=%s",
-        working_dir, cfg["llm_model"], cfg["embedding_model"],
+        working_dir, llm_backend, cfg["embedding_model"],
         cfg["embedding_dim"], cfg["vector_storage"],
     )
     return rag
@@ -218,6 +264,10 @@ def _cleanup_failed_docs_for_path(rag: "LightRAG", file_path: str) -> int:
 def insert(text: str, file_path: str | None = None) -> str | None:
     """Insert a document into LightRAG with retry. Returns track_id."""
     rag = get_instance()
+
+    # Strip YAML frontmatter before insertion — prevents LLM from
+    # extracting metadata keys (type, tags, etc.) as entities.
+    text = strip_frontmatter(text)
 
     if file_path:
         _cleanup_failed_docs_for_path(rag, file_path)
@@ -532,14 +582,29 @@ def find_similar_notes(text: str, vault_path: str, limit: int = 3,
     return titles[:limit]
 
 
+# Module-level cache: when we first observed each orphan path.
+# Used to enforce min_orphan_age_sec — protects against transient disappearances
+# (git pull mid-checkout, rsync, rename-as-delete+create).
+_orphan_first_seen: dict[str, float] = {}
+
+
 def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None,
-                    dry_run: bool = False) -> dict:
+                    dry_run: bool = False,
+                    min_orphan_age_sec: int = 0) -> dict:
     """Sync LightRAG graph with actual vault files.
 
-    By default (dry_run=True in watcher): returns orphans WITHOUT deleting.
-    With dry_run=False: actually deletes orphan docs (use only from API /reindex-sync).
-    Returns: {deleted: [doc_ids], orphans: [paths], kept: int}
+    dry_run=True  — report orphans only, no deletion.
+    dry_run=False — delete orphans older than min_orphan_age_sec from KG and
+                    from Layer 2 (Qdrant archives). Owner hub files are
+                    reported via 'owner_missing' but never auto-deleted.
+    min_orphan_age_sec — orphan is deleted only after being continuously
+                    missing for at least this many seconds. 0 means immediate.
+
+    Returns: {deleted, orphans, deferred, owner_missing, kept}
     """
+    import time as _time
+    from .path_sync import list_owner_root_paths, classify_orphans
+
     vault = Path(vault_path)
     if skip_dirs is None:
         skip_dirs = VAULT_SKIP_DIRS
@@ -553,27 +618,59 @@ def sync_with_vault(vault_path: str, skip_dirs: set[str] | None = None,
         for f in d.rglob("*.md"):
             if not f.name.startswith("."):
                 vault_paths.add(str(f.relative_to(vault)))
+    for rel in list_owner_root_paths(str(vault)):
+        vault_paths.add(rel)
 
-    # Compare by file_path (not content hash) — robust to file edits
     indexed_paths = get_indexed_paths()  # {file_path: doc_id}
     if not indexed_paths:
-        return {"deleted": [], "orphans": [], "kept": 0}
+        return {"deleted": [], "orphans": [], "deferred": [], "owner_missing": [], "kept": 0}
 
     orphan_items = [(fp, did) for fp, did in indexed_paths.items() if fp not in vault_paths]
-    orphan_ids = [did for _, did in orphan_items]
+    ready, deferred, owner_missing = classify_orphans(
+        orphan_items, _time.time(), _orphan_first_seen, min_orphan_age_sec,
+    )
     orphan_paths = [fp for fp, _ in orphan_items]
 
-    deleted = []
-    if not dry_run:
-        for doc_id in orphan_ids:
-            if delete_doc(doc_id):
-                deleted.append(doc_id)
-                logger.info("Sync: removed orphan doc %s", doc_id)
-        if deleted:
-            logger.info("Vault sync: deleted %d orphan docs, kept %d",
-                        len(deleted), len(indexed_paths) - len(deleted))
+    deleted: list[str] = []
+    archive_points_removed = 0
+    if not dry_run and ready:
+        try:
+            from . import vector_store
+            _delete_archive = vector_store.delete_archive_by_path
+        except Exception:
+            _delete_archive = None
 
-    return {"deleted": deleted, "orphans": orphan_paths, "kept": len(indexed_paths) - len(orphan_ids)}
+        for fp, did in ready:
+            if delete_doc(did):
+                deleted.append(did)
+                _orphan_first_seen.pop(fp, None)
+                logger.info("Sync: removed orphan doc %s (path=%s)", did, fp)
+                if _delete_archive:
+                    try:
+                        archive_points_removed += _delete_archive(fp)
+                    except Exception as e:
+                        logger.warning("Archive delete failed for %s: %s", fp, e)
+        if deleted:
+            logger.info(
+                "Vault sync: deleted %d orphan docs (archive points: %d), kept %d",
+                len(deleted), archive_points_removed,
+                len(indexed_paths) - len(deleted),
+            )
+
+    if owner_missing:
+        logger.error(
+            "Sync: owner hub file(s) missing from vault: %s — NOT deleting from graph",
+            owner_missing,
+        )
+
+    return {
+        "deleted": deleted,
+        "orphans": orphan_paths,
+        "deferred": deferred,
+        "owner_missing": owner_missing,
+        "kept": len(indexed_paths) - len(deleted),
+        "archive_points_removed": archive_points_removed,
+    }
 
 
 def shutdown():

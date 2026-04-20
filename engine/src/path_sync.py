@@ -15,21 +15,91 @@ import json
 import logging
 import os
 import re
-import urllib.request
-import urllib.parse
 from pathlib import Path
 
 import yaml
+
+from .telegram import notify_inbox as _notify_telegram
 
 logger = logging.getLogger(__name__)
 
 VAULT_PATH = os.getenv("VAULT_PATH", "/app/vault")
 INBOX_DIR_NAME = os.getenv("INBOX_DIR_NAME", "_inbox")
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
+VAULT_SKIP_DIRS = frozenset({"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"})
 _CACHE_FILE = os.path.join(VAULT_PATH, ".frontmatter_cache.json")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_DM_CHAT_ID", "166009183")
+# Root-level files that should be indexed despite living at vault root (hub notes, owner profile).
+# Configured via env: VAULT_OWNER_FILES="Михаил Михайлов.md|Other.md"
+VAULT_OWNER_FILES = frozenset(
+    f.strip() for f in os.getenv("VAULT_OWNER_FILES", "").split("|") if f.strip()
+)
+
+
+def is_owner_root_file(path: str, vault_path: str) -> bool:
+    """True if path is a whitelisted root-level owner file (e.g. hub profile note)."""
+    if not VAULT_OWNER_FILES:
+        return False
+    if not path.endswith(".md"):
+        return False
+    try:
+        rel = os.path.relpath(path, vault_path)
+    except ValueError:
+        return False
+    parts = Path(rel).parts
+    if len(parts) != 1:
+        return False
+    return parts[0] in VAULT_OWNER_FILES
+
+
+def list_owner_root_paths(vault_path: str) -> list[str]:
+    """Return existing root-level owner files as vault-relative paths."""
+    vault = Path(vault_path)
+    result = []
+    for name in VAULT_OWNER_FILES:
+        p = vault / name
+        if p.exists() and p.is_file():
+            result.append(name)
+    return result
+
+
+def classify_orphans(
+    orphan_items: list[tuple[str, str]],
+    now: float,
+    first_seen: dict[str, float],
+    min_age_sec: int,
+    owner_files: frozenset[str] | set[str] | None = None,
+) -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """Partition orphans into (ready-for-delete, deferred, owner_missing).
+
+    Pure function — no side effects except mutating first_seen (caller owns it).
+    - owner_missing: orphan paths that are whitelisted owner files. Never deleted.
+    - deferred: orphan is too fresh (age < min_age_sec).
+    - ready: (path, doc_id) pairs safe to delete.
+    """
+    if owner_files is None:
+        owner_files = VAULT_OWNER_FILES
+
+    # Drop resolved orphans from first_seen cache
+    active = {fp for fp, _ in orphan_items}
+    for fp in list(first_seen.keys()):
+        if fp not in active:
+            first_seen.pop(fp, None)
+    for fp, _ in orphan_items:
+        first_seen.setdefault(fp, now)
+
+    ready: list[tuple[str, str]] = []
+    deferred: list[str] = []
+    owner_missing: list[str] = []
+    for fp, did in orphan_items:
+        if fp in owner_files:
+            owner_missing.append(fp)
+            continue
+        age = now - first_seen.get(fp, now)
+        if age >= min_age_sec:
+            ready.append((fp, did))
+        else:
+            deferred.append(fp)
+    return ready, deferred, owner_missing
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +178,7 @@ def _iter_vault_notes(vault: Path):
             if d.suffix == ".md" and not d.name.startswith("."):
                 yield d
             continue
-        if d.name in _SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
+        if d.name in VAULT_SKIP_DIRS or d.name.startswith(".") or d.name == INBOX_DIR_NAME:
             continue
         for f in d.rglob("*.md"):
             if not f.name.startswith("."):
@@ -153,8 +223,10 @@ def _body_hash(content: str) -> str:
 def _is_vault_note(path: str, vault_path: str) -> bool:
     """Check if path is a valid vault note (not in skip dirs, not inbox).
 
-    Only accepts files inside subdirectories (knowledge/, goals/, etc.).
-    Root-level files like CLAUDE.md are system files, not notes.
+    Accepts:
+    - Files inside subdirectories (knowledge/, goals/, etc.)
+    - Whitelisted root-level owner files (hub profile notes). See VAULT_OWNER_FILES.
+    Rejects everything else at root — CLAUDE.md and other system files are not notes.
     """
     if not path.endswith(".md"):
         return False
@@ -163,10 +235,9 @@ def _is_vault_note(path: str, vault_path: str) -> bool:
     except ValueError:
         return False
     parts = Path(rel).parts
-    # Must be inside a subdirectory, not root-level
-    if len(parts) < 2:
-        return False
-    if any(p in _SKIP_DIRS or p.startswith(".") for p in parts):
+    if len(parts) == 1:
+        return parts[0] in VAULT_OWNER_FILES
+    if any(p in VAULT_SKIP_DIRS or p.startswith(".") for p in parts):
         return False
     if parts and parts[0] == INBOX_DIR_NAME:
         return False
@@ -238,32 +309,6 @@ def _reindex_in_lightrag(file_path: Path, vault_path: str):
         logger.info("LightRAG re-indexed: %s", rel_path)
     except Exception as e:
         logger.warning("LightRAG re-index failed for %s: %s", file_path, e)
-
-
-# ---------------------------------------------------------------------------
-# Telegram notification
-# ---------------------------------------------------------------------------
-
-def _notify_telegram(message: str):
-    """Send notification to Telegram (non-blocking, best-effort)."""
-    if not TELEGRAM_BOT_TOKEN:
-        logger.debug("Telegram notification skipped (no bot token)")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-    }).encode("utf-8")
-
-    try:
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status != 200:
-                logger.warning("Telegram notification failed: HTTP %d", resp.status)
-    except Exception as e:
-        logger.warning("Telegram notification failed: %s", e)
 
 
 # ---------------------------------------------------------------------------

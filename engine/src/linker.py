@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 import yaml as yaml_lib
 
+from .path_sync import VAULT_SKIP_DIRS
+
 _client: genai.Client | None = None
 _existing_notes_cache: list[str] | None = None
 _existing_tags_cache: set[str] | None = None
@@ -21,7 +23,54 @@ _note_types_cache: dict[str, str] | None = None
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-2.5-pro")
 CLASSIFY_MODEL = os.getenv("CLASSIFY_MODEL", "gemini-2.5-flash")
 
-_SKIP_DIRS = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash", "_system"}
+# Anchor hub: if a note mentions the owner or any alias, auto-link to hub title.
+# Configured via env so ops can adjust without code changes.
+ANCHOR_HUB_TITLE = os.getenv("ANCHOR_HUB_TITLE", "").strip()
+ANCHOR_HUB_ALIASES = tuple(
+    a.strip() for a in os.getenv("ANCHOR_HUB_ALIASES", "").split("|") if a.strip()
+)
+
+
+def _mentions_anchor(text: str) -> bool:
+    """True if text mentions hub title or any alias. Case-insensitive, word-bounded."""
+    if not ANCHOR_HUB_TITLE:
+        return False
+    needles = [ANCHOR_HUB_TITLE, *ANCHOR_HUB_ALIASES]
+    hay = text.lower()
+    for needle in needles:
+        if not needle:
+            continue
+        n = needle.lower()
+        # Crude word-boundary: require non-alphanumeric neighbours unless at edge
+        idx = hay.find(n)
+        while idx != -1:
+            left_ok = idx == 0 or not hay[idx - 1].isalnum()
+            right = idx + len(n)
+            right_ok = right == len(hay) or not hay[right].isalnum()
+            if left_ok and right_ok:
+                return True
+            idx = hay.find(n, idx + 1)
+    return False
+
+
+def _is_anchor_hub_note(text: str) -> bool:
+    """True if the note itself is the anchor hub (by frontmatter title or role=owner)."""
+    if not text.startswith("---"):
+        return False
+    end = text.find("\n---", 3)
+    if end < 0:
+        return False
+    fm = text[3:end]
+    if "role: owner" in fm or "role:owner" in fm:
+        return True
+    if ANCHOR_HUB_TITLE:
+        # match title: "ANCHOR_HUB_TITLE" or title: ANCHOR_HUB_TITLE
+        import re as _re
+        pat = _re.compile(r'^title:\s*["\']?' + _re.escape(ANCHOR_HUB_TITLE) + r'["\']?\s*$', _re.MULTILINE)
+        if pat.search(fm):
+            return True
+    return False
+
 
 
 def _get_client() -> genai.Client:
@@ -40,7 +89,7 @@ def _scan_existing_notes(vault_path: str) -> list[str]:
     notes = []
     vault = Path(vault_path)
     for d in vault.iterdir():
-        if not d.is_dir() or d.name in _SKIP_DIRS or d.name.startswith("."):
+        if not d.is_dir() or d.name in VAULT_SKIP_DIRS or d.name.startswith("."):
             continue
         for f in d.rglob("*.md"):
             name = f.stem.replace("-", " ").replace("_", " ")
@@ -158,15 +207,14 @@ def _scan_vault_tree_with_descriptions(vault_path: str) -> dict[str, str]:
     Returns {relative_path: description} sorted by path.
     """
     vault = Path(vault_path)
-    skip = {"templates", ".obsidian", ".git", ".lightrag", ".entire", ".trash"}
-    inbox = os.getenv("INBOX_DIR_NAME", "_inbox")
     result: dict[str, str] = {}
+    inbox = os.getenv("INBOX_DIR_NAME", "_inbox")
     for d in vault.rglob("*"):
         if not d.is_dir():
             continue
         rel = d.relative_to(vault)
         parts = rel.parts
-        if any(p in skip or p.startswith(".") for p in parts):
+        if any(p in VAULT_SKIP_DIRS or p.startswith(".") for p in parts):
             continue
         if parts[0] == inbox:
             continue
@@ -479,6 +527,19 @@ def suggest_links(text: str, vault_path: str, limit: int = 5) -> list[str]:
             elif shorter / max(len(entity_lower), len(note_lower)) > 0.6:
                 if note_lower in entity_lower or entity_lower in note_lower:
                     matched.append(note_orig)
+
+    # Anchor-hub auto-injection: if the note mentions the owner (or an alias)
+    # and the hub title exists in vault, always include it. Owner hub itself is
+    # excluded to avoid self-referencing.
+    if (
+        ANCHOR_HUB_TITLE
+        and ANCHOR_HUB_TITLE not in matched
+        and not _is_anchor_hub_note(text)
+        and _mentions_anchor(text)
+        and ANCHOR_HUB_TITLE.lower() in {n.lower() for n in existing_notes}
+    ):
+        # Insert at front so it survives the limit truncation.
+        matched = [ANCHOR_HUB_TITLE] + matched
 
     return matched[:limit]
 
